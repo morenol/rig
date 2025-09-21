@@ -230,7 +230,25 @@ pub struct Message {
     pub role: String,
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    type_: String,
+    function: ToolFunction,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ToolFunction {
+    name: String,
+    arguments: String,
 }
 
 impl TryFrom<Message> for message::Message {
@@ -274,17 +292,41 @@ impl TryFrom<message::Message> for Message {
 
     fn try_from(message: message::Message) -> Result<Self, Self::Error> {
         match message {
-            message::Message::User { content } => Ok(Self {
-                role: "user".to_string(),
-                content: content.iter().find_map(|c| match c {
-                    message::UserContent::Text(text) => Some(text.text.clone()),
-                    _ => None,
-                }),
-                reasoning: None,
-            }),
+            message::Message::User { content } => {
+                // if there are a tool result, we send using role: tool
+
+                if let Some(tool_result) = content
+                    .iter()
+                    .find(|c| matches!(c, message::UserContent::ToolResult(_)))
+                {
+                    if let message::UserContent::ToolResult(tool_result) = tool_result {
+                        return Ok(Self {
+                            role: "tool".to_string(),
+                            content: tool_result.content.iter().find_map(|c| match c {
+                                message::ToolResultContent::Text(text) => Some(text.text.clone()),
+                                _ => None,
+                            }),
+                            tool_calls: None,
+                            reasoning: None,
+                            tool_call_id: Some(tool_result.id.clone()),
+                        });
+                    }
+                }
+                Ok(Self {
+                    role: "user".to_string(),
+                    content: content.iter().find_map(|c| match c {
+                        message::UserContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    }),
+                    tool_calls: None,
+                    reasoning: None,
+                    tool_call_id: None,
+                })
+            }
             message::Message::Assistant { content, .. } => {
                 let mut text_content: Option<String> = None;
                 let mut groq_reasoning: Option<String> = None;
+                let mut tool_calls: Vec<ToolCall> = Vec::new();
 
                 for c in content.iter() {
                     match c {
@@ -299,10 +341,21 @@ impl TryFrom<message::Message> for Message {
                                     .unwrap_or_else(|| text.text.clone()),
                             );
                         }
-                        message::AssistantContent::ToolCall(_tool_call) => {
-                            return Err(MessageError::ConversionError(
-                                "Tool calls do not exist on this message".into(),
-                            ));
+                        message::AssistantContent::ToolCall(tool_call) => {
+                            tool_calls.push(ToolCall {
+                                id: tool_call.id.clone(),
+                                type_: "function".to_string(),
+                                function: ToolFunction {
+                                    name: tool_call.function.name.clone(),
+                                    arguments: serde_json::to_string(&tool_call.function.arguments)
+                                        .map_err(|e| {
+                                            MessageError::ConversionError(format!(
+                                                "Failed to serialize tool call arguments: {}",
+                                                e
+                                            ))
+                                        })?,
+                                },
+                            });
                         }
                         message::AssistantContent::Reasoning(message::Reasoning {
                             reasoning,
@@ -316,8 +369,14 @@ impl TryFrom<message::Message> for Message {
 
                 Ok(Self {
                     role: "assistant".to_string(),
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
                     content: text_content,
                     reasoning: groq_reasoning,
+                    tool_call_id: None,
                 })
             }
         }
@@ -388,7 +447,9 @@ impl CompletionModel {
                     vec![Message {
                         role: "system".to_string(),
                         content: Some(preamble),
+                        tool_calls: None,
                         reasoning: None,
+                        tool_call_id: None,
                     }]
                 });
 
@@ -437,7 +498,6 @@ impl completion::CompletionModel for CompletionModel {
         completion_request: CompletionRequest,
     ) -> Result<completion::CompletionResponse<CompletionResponse>, CompletionError> {
         let request = self.create_completion_request(completion_request)?;
-
         let response = self
             .client
             .post("/chat/completions")
